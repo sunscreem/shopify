@@ -62,9 +62,10 @@ class ImportSingleProductJob implements ShouldQueue
             }
         }
 
+        $published = $this->data['status'] === 'active' ? true : false;
+
         $data = [
             'product_id' => $this->data['id'],
-            'published' => $this->data['status'] === 'active' ? true : false,
             'published_at' => $this->data['status'] === 'active' ? Carbon::parse($this->data['published_at'])->format('Y-m-d H:i:s') : null,
             'title' => (! $entry || config('shopify.overwrite.title')) ? $this->data['title'] : $entry->title,
             'content' => (! $entry || config('shopify.overwrite.content')) ? $this->data['body_html'] : $entry->content,
@@ -95,19 +96,26 @@ class ImportSingleProductJob implements ShouldQueue
 
         // Import Images
         if ($this->data['image']) {
-            $asset = $this->importImages($this->data['image']);
-            $data['featured_image'] = $asset->path();
+            if ($asset = $this->importImages($this->data['image'])) {
+                $data['featured_image'] = $asset->path();
+            }
         }
 
         if ($this->data['images']) {
             foreach ($this->data['images'] as $image) {
-                $asset = $this->importImages($image);
-                $data['gallery'][] = $asset->path();
+                if ($asset = $this->importImages($image)) {
+                    $data['gallery'][] = $asset->path();
+                }
             }
         }
 
-        if ($this->orderData) {
-            $data = $this->updatePurchaseHistory($data);
+        if ($this->orderData && ($quantities = Arr::get($this->orderData, 'quantity'))) {
+            $qty = 0;
+            foreach ($quantities as $sku => $q) {
+                $qty += (int) $q;
+            }
+
+            $data = $this->updatePurchaseHistory($data, $qty);
         }
 
         $entry->merge($data);
@@ -223,8 +231,6 @@ class ImportSingleProductJob implements ShouldQueue
                             $published = true;
                         }
                     }
-
-                    $entry->published($published);
                 }
             } catch (\Throwable $e) {
                 Log::error('Could not manage publications status for product '.$this->data['id']);
@@ -235,6 +241,7 @@ class ImportSingleProductJob implements ShouldQueue
             Log::error($e->getMessage());
         }
 
+        $entry->published($published);
         $entry->save();
 
         // if we are multisite, get translations
@@ -353,14 +360,15 @@ class ImportSingleProductJob implements ShouldQueue
             if ($variant['image_id']) {
                 foreach (($this->data['images'] ?? []) as $image) {
                     if ($image['id'] == $variant['image_id']) {
-                        $asset = $this->importImages($image);
-                        $data['image'] = $asset->path();
+                        if ($asset = $this->importImages($image)) {
+                            $data['image'] = $asset->path();
+                        }
                     }
                 }
             }
 
             if ($this->orderData && ($qty = Arr::get($this->orderData, 'quantity.'.$variant['sku']))) {
-                $data = $this->updatePurchaseHistory($data);
+                $data = $this->updatePurchaseHistory($data, (int) $qty);
             }
 
             $entry->merge($data);
@@ -451,7 +459,7 @@ class ImportSingleProductJob implements ShouldQueue
     /**
      * Update the purchase history for this item
      */
-    private function updatePurchaseHistory(array $data): array
+    private function updatePurchaseHistory(array $data, int $qty): array
     {
         $data['last_purchased'] = $this->orderData['date']->format('Y-m-d H:i:s');
 
